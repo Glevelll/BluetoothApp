@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import com.project.bluetoothapp.domain.chat.BluetoothController
 import com.project.bluetoothapp.domain.chat.BluetoothDeviceDomain
+import com.project.bluetoothapp.domain.chat.BluetoothMessage
 import com.project.bluetoothapp.domain.chat.ConnectionResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,8 +23,10 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -42,7 +45,9 @@ class AndroidBluetoothController(
         bluetoothManager?.adapter
     }
 
-    private val _isConnected = MutableStateFlow<Boolean>(false)
+    private var dataTransferService: BluetoothDataTransferService? = null
+
+    private val _isConnected = MutableStateFlow(false)
     override val isConnected: StateFlow<Boolean>
         get() = _isConnected.asStateFlow()
 
@@ -66,18 +71,17 @@ class AndroidBluetoothController(
     }
 
     private val bluetoothStateReceiver = BluetoothStateReceiver { isConnected, bluetoothDevice ->
-        if (bluetoothAdapter?.bondedDevices?.contains(bluetoothDevice) == true){
+        if(bluetoothAdapter?.bondedDevices?.contains(bluetoothDevice) == true) {
             _isConnected.update { isConnected }
         } else {
             CoroutineScope(Dispatchers.IO).launch {
-                _errors.tryEmit("Невозможно соединиться")
+                _errors.emit("Невозможно соединиться")
             }
         }
     }
 
     private var currentServerSocket: BluetoothServerSocket? = null
     private var currentClientSocket: BluetoothSocket? = null
-
 
     init {
         updatePairedDevices()
@@ -87,12 +91,11 @@ class AndroidBluetoothController(
                 addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
                 addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
                 addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
-                addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             }
         )
     }
 
-    override fun startDiscovery() { // поиск устройств Bluetooth в радиусе действия
+    override fun startDiscovery() {
         if(!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
             return
         }
@@ -104,7 +107,7 @@ class AndroidBluetoothController(
         bluetoothAdapter?.startDiscovery()
     }
 
-    override fun stopDiscovery() { // останавливает поиск
+    override fun stopDiscovery() {
         if(!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
             return
         }
@@ -112,28 +115,35 @@ class AndroidBluetoothController(
         bluetoothAdapter?.cancelDiscovery()
     }
 
-    override fun startBluetoothServer(): Flow<ConnectionResult> { // начинает прослушивание входящих соединений Bluetooth
+    override fun startBluetoothServer(): Flow<ConnectionResult> {
         return flow {
             if(!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
-                throw SecurityException("Нет разрешения на соединение")
+                throw SecurityException("Нет разрешения")
             }
-
             currentServerSocket = bluetoothAdapter?.listenUsingRfcommWithServiceRecord(
                 "chat_service",
                 UUID.fromString(SERVICE_UUID)
             )
-
             var shouldLoop = true
-            while (shouldLoop) {
+            while(shouldLoop) {
                 currentClientSocket = try {
                     currentServerSocket?.accept()
-                } catch (e: IOException) {
+                } catch(e: IOException) {
                     shouldLoop = false
                     null
                 }
                 emit(ConnectionResult.ConnectionEstablished)
                 currentClientSocket?.let {
                     currentServerSocket?.close()
+                    val service = BluetoothDataTransferService(it)
+                    dataTransferService = service
+                    emitAll(
+                        service
+                            .listenForIncomingMessages()
+                            .map {
+                                ConnectionResult.TransferSucceeded(it)
+                            }
+                    )
                 }
             }
         }.onCompletion {
@@ -141,28 +151,33 @@ class AndroidBluetoothController(
         }.flowOn(Dispatchers.IO)
     }
 
-    override fun connectToDevice(device: BluetoothDeviceDomain): Flow<ConnectionResult> { // устанавливает соединение с указанным устройством Bluetooth
+    override fun connectToDevice(device: BluetoothDeviceDomain): Flow<ConnectionResult> {
         return flow {
-            if (!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
-                throw SecurityException("Нет разрешения на соединение")
+            if(!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+                throw SecurityException("Нет разрешения")
             }
-
-            val bluetoothDevice = bluetoothAdapter?.getRemoteDevice(device.address)
-
-            currentClientSocket = bluetoothDevice
+            currentClientSocket = bluetoothAdapter
+                ?.getRemoteDevice(device.address)
                 ?.createRfcommSocketToServiceRecord(
                     UUID.fromString(SERVICE_UUID)
                 )
             stopDiscovery()
-
             currentClientSocket?.let { socket ->
                 try {
                     socket.connect()
                     emit(ConnectionResult.ConnectionEstablished)
-                } catch (e: IOException) {
+
+                    BluetoothDataTransferService(socket).also {
+                        dataTransferService = it
+                        emitAll(
+                            it.listenForIncomingMessages()
+                                .map { ConnectionResult.TransferSucceeded(it) }
+                        )
+                    }
+                } catch(e: IOException) {
                     socket.close()
                     currentClientSocket = null
-                    emit(ConnectionResult.Error("Подключение прервано"))
+                    emit(ConnectionResult.Error("Соединение разорвано"))
                 }
             }
         }.onCompletion {
@@ -170,14 +185,30 @@ class AndroidBluetoothController(
         }.flowOn(Dispatchers.IO)
     }
 
-    override fun closeConnection() { // разрывает текущее соединение
+    override suspend fun trySendMessage(message: String): BluetoothMessage? {
+        if(!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+            return null
+        }
+        if(dataTransferService == null) {
+            return null
+        }
+        val bluetoothMessage = BluetoothMessage(
+            message = message,
+            senderName = bluetoothAdapter?.name ?: "Имя",
+            isFromLocalUser = true
+        )
+        dataTransferService?.sendMessage(bluetoothMessage.toByteArray())
+        return bluetoothMessage
+    }
+
+    override fun closeConnection() {
         currentClientSocket?.close()
         currentServerSocket?.close()
         currentClientSocket = null
         currentServerSocket = null
     }
 
-    override fun release() { // освобождает ресурсы
+    override fun release() {
         context.unregisterReceiver(foundDeviceReceiver)
         context.unregisterReceiver(bluetoothStateReceiver)
         closeConnection()
@@ -200,6 +231,6 @@ class AndroidBluetoothController(
     }
 
     companion object {
-        const val SERVICE_UUID = "27b71da-08c7-4505-a6d1-249987e5e2d"
+        const val SERVICE_UUID = "27b7d1da-08c7-4505-a6d1-2459987e5e2d"
     }
 }

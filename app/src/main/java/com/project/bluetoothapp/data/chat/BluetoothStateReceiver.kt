@@ -11,7 +11,7 @@ class BluetoothStateReceiver(
 ): BroadcastReceiver() {
 
     override fun onReceive(context: Context?, intent: Intent?) {
-        val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent?.getParcelableExtra(
                 BluetoothDevice.EXTRA_DEVICE,
                 BluetoothDevice::class.java
@@ -21,10 +21,10 @@ class BluetoothStateReceiver(
         }
         when(intent?.action) {
             BluetoothDevice.ACTION_ACL_CONNECTED -> {
-                onStateChanged(true, device?: return)
+                onStateChanged(true, device ?: return)
             }
             BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
-                onStateChanged(false, device?: return)
+                onStateChanged(false, device ?: return)
             }
         }
     }

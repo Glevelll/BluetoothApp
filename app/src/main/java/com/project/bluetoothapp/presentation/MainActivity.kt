@@ -25,6 +25,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.project.bluetoothapp.presentation.components.ChatScreen
 import com.project.bluetoothapp.presentation.components.DeviceScreen
 import com.project.bluetoothapp.ui.theme.BluetoothAppTheme
 import dagger.hilt.android.AndroidEntryPoint
@@ -91,7 +92,7 @@ class MainActivity : ComponentActivity() {
                     if(state.isConnected) {
                         Toast.makeText(
                             applicationContext,
-                            "Соединено",
+                            "You're connected!",
                             Toast.LENGTH_LONG
                         ).show()
                     }
@@ -108,8 +109,15 @@ class MainActivity : ComponentActivity() {
                                 verticalArrangement = Arrangement.Center
                             ) {
                                 CircularProgressIndicator()
-                                Text(text = "Соединение")
+                                Text(text = "Connecting...")
                             }
+                        }
+                        state.isConnected -> {
+                            ChatScreen(
+                                state = state,
+                                onDisconnect = viewModel::disconnectFromDevice,
+                                onSendMessage = viewModel::sendMessage
+                            )
                         }
                         else -> {
                             DeviceScreen(
